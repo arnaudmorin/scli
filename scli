@@ -17,6 +17,8 @@ import bisect
 import shlex
 from subprocess import PIPE, Popen
 from datetime import datetime
+import socket
+import random
 
 import urwid
 
@@ -33,18 +35,14 @@ except ImportError:
 DATA_FOLDER = os.getenv('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
 CFG_FOLDER = os.getenv('XDG_CONFIG_HOME', os.path.expanduser('~/.config'))
 
-SIGNALCLI_LEGACY_FOLDER = os.path.join(CFG_FOLDER, 'signal')
-SIGNALCLI_LEGACY_DATA_FOLDER = os.path.join(SIGNALCLI_LEGACY_FOLDER, 'data')
-SIGNALCLI_LEGACY_ATTACHMENT_FOLDER = os.path.join(SIGNALCLI_LEGACY_FOLDER, 'attachments')
-
-SIGNALCLI_FOLDER = os.path.join(DATA_FOLDER, 'signal-cli')
-SIGNALCLI_DATA_FOLDER = os.path.join(SIGNALCLI_FOLDER, 'data')
-SIGNALCLI_ATTACHMENT_FOLDER = os.path.join(SIGNALCLI_FOLDER, 'attachments')
-
 SCLI_DATA_FOLDER = os.path.join(DATA_FOLDER, 'scli')
 SCLI_HISTORY_FILE = os.path.join(SCLI_DATA_FOLDER, 'history')
-SCLI_CFG_FILE = os.path.join(CFG_FOLDER, 'sclirc')
+SCLI_CFG_FILE = os.path.join(CFG_FOLDER, 'scli.conf')
 SCLI_LOG_FILE = os.path.join(SCLI_DATA_FOLDER, 'log')
+
+SIGNALD_SOCKET_PATH = "/var/run/signald/signald.sock"
+SIGNALD_DATA_FOLDER = "/var/lib/signald/data"
+SIGNALD_ATTACHMENT_FOLDER = "/var/lib/signald/attachments"
 
 # #############################################################################
 # coloring stuff
@@ -170,15 +168,16 @@ def get_contact_name(x):
         logging.critical('get_contact_name:empty sender')
         return "NULL"
 
-    name = x.get('name')
-    if name or name.strip(' ') != '':
-        return name
+    result = "Unknown"
+    try:
+        # First check if we have a name
+        result = x.get('name')
+        if not result:
+            result = x.get('number')
+    except Exception:
+        result = "Error"
 
-    number = x.get('number')
-    if number:
-        return number
-
-    return "NULL"
+    return result
 
 def get_contact_number(x):
     if not x:
@@ -190,13 +189,6 @@ def get_contact_number(x):
         return number
 
     return "NULL"
-
-def get_contact_color(x):
-    color = x.get('color')
-    if color or color.strip(' ') != '':
-        return color
-
-    return 'white'
 
 def is_contact_group(contact):
     return has_key('groupId', contact)
@@ -290,9 +282,7 @@ def get_attachment_name(attachment):
 
 def get_attachment_path(attachment):
     if isinstance(attachment, dict):
-        received_attachment = os.path.join(SIGNALCLI_ATTACHMENT_FOLDER, str(attachment['id']))
-        if not os.path.exists(received_attachment):
-            received_attachment = os.path.join(SIGNALCLI_LEGACY_ATTACHMENT_FOLDER, str(attachment['id']))
+        received_attachment = os.path.join(SIGNALD_ATTACHMENT_FOLDER, str(attachment['id']))
         return received_attachment
     elif isinstance(attachment, str) and os.path.exists(attachment):
         return attachment
@@ -521,7 +511,12 @@ class Commands:
                     (['openUrl', 'u'], self.open_last_url),
                     (['toggleNotifications', 'n'], self.toggle_notifications),
                     (['toggleAutohide', 'h'], self.toggle_autohide),
+                    (['sync', 's'], self.sync),
                     (['quit', 'q'], self.quit)]
+
+    def sync(self, args):
+        logging.debug("Synchronizing contacts")
+        #self.state.signal.sync_contacts()
 
     def exec(self, cmd, args):
         for (abbrvs, fn) in self.map:
@@ -636,14 +631,23 @@ class Signal:
 
     def __init__(self, user):
         self.user = user
+        self.fd = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.fd.connect(SIGNALD_SOCKET_PATH)
+        self.fd.send(json.dumps(
+            {"type": "subscribe", "username": self.user}).encode("utf8") + b"\n"
+        )
+        self.sent_waiting = {}
+
         self._data = None
-        self._buffer = b''
-        self._path = os.path.join(SIGNALCLI_DATA_FOLDER, user)
+        self._path = os.path.join(SIGNALD_DATA_FOLDER, user)
 
         if not os.path.exists(self._path):
-            self._path = os.path.join(SIGNALCLI_LEGACY_DATA_FOLDER, user)
-            if not os.path.exists(self._path):
-                raise Exception(self.user + " does not exist!")
+            raise Exception(
+                "{} does not exist in signald ({} not found)!".format(
+                    self.user,
+                    self._path
+                )
+            )
 
         self.reload_data()
 
@@ -652,81 +656,102 @@ class Signal:
             self._data = json.load(f)
 
     def start_daemon(self, loop):
-        fd = loop.watch_pipe(self.daemon_handler)
-        return Popen(['signal-cli', '-u', self.user, 'daemon', '--json'], stdout=fd, stderr=fd, close_fds=True)
+        loop.watch_file(self.fd, self.daemon_handler)
 
-    def daemon_handler(self, line):
-        line = self._buffer + line
-        lines = line.split(b'\n')
-        if lines[-1] != b'':
-            # Not a complete message. Store in buffer
-            self._buffer = lines[-1]
-        else:
-            self._buffer = b''
+    def sync_contacts(self):
+        # sync contacts
+        self.fd.send(json.dumps(
+            {"type": "sync_contacts", "username": self.user}).encode("utf8") + b"\n"
+        )
 
-        # The last item is either empty or an incomplete message, so we don't process it
-        for line in lines[:-1]:
-            if not line.strip():
-                continue
+    def daemon_handler(self):
+        line = self.fd.makefile().readline()
+        #logging.debug("Size of waiting {}".format(len(self.sent_waiting)))
 
-            try:
-                e = json.loads(line.decode('utf-8'))
-                envelope = e['envelope']
+        # Read the data
+        try:
+            data = json.loads(line)
 
-                syncMessage = envelope['syncMessage']
-                if syncMessage is not None \
-                and syncMessage['sentMessage'] is not None:
+            if data["type"] == "version":
+                # We receive a "version" message when we connect
+                logging.info("Connected to signald, version {}".format(
+                    data["data"]["version"]))
+                # sync contacts
+                #self.fd.send(json.dumps(
+                #    {"type": "sync_contacts", "username": self.user}).encode("utf8") + b"\n"
+                #)
+            elif data["type"] == "subscribed":
+                # We are ready to receive messages
+                logging.info("Ready")
+            elif data["type"] == "message" and "dataMessage" in data["data"]:
+                # We received a message
+                logging.debug("Received a message: {}".format(data["data"]["dataMessage"]))
+                urwid.emit_signal(self, 'receive_message', data["data"])
+            elif data["type"] == "message" and "isReceipt" in data["data"] \
+                    and data["data"]["isReceipt"]:
+                logging.debug("Message from {} to {} is received".format(
+                    data["data"]["username"],
+                    data["data"]["source"]
+                ))
+            elif "id" in data and data["id"] in self.sent_waiting:
+                # Check the status of a sent command
+                if data["type"] == "success":
+                    logging.debug("Success")
+                    # We are here when the daemon was able to send a message
+                    # Collect back the message from sent_waiting
+                    message = self.sent_waiting[data["id"]]
+                    del self.sent_waiting[data["id"]]
+                    # Tell urwid that the message is sent
+                    # We do that by rebuilding an enveloppe just like if we received a message
+                    ts = int(datetime.now().timestamp() * 1000)
+                    envelope = {'source': message["username"],
+                                'target': message["recipientNumber"],
+                                'timestamp': ts,
+                                'dataMessage': {'message': message["messageBody"],
+                                                'attachments': [],  # TODO
+                                                'timestamp': ts}}
                     urwid.emit_signal(self, 'send_message', envelope)
-                elif envelope['dataMessage'] is not None:
-                    urwid.emit_signal(self, 'receive_message', envelope)
-                else:
-                    logging.info('NOT_A_MESSAGE:%s', envelope)
+            else:
+                # We received something else
+                logging.debug(data)
+        except Exception as e:
+            logging.error("error reading raw data {}".format(raw))
 
-            except Exception as e:
-                logging.error('input: %s', line)
-                logging.exception(e)
-                # TODO: display error to user
-                continue
+    def send_message(self, contact, message="", attachments=[]):
+        if attachments:
+            # TODO
+            logging.warning('send_message: attachments not yet supported')
 
-    def send_message(self, contact, message="", attachments=None):
-        if not attachments:
-            attachments = []
-
-        args = ['signal-cli', '--dbus', 'send', '--message', message]
         target = None
-        if contact.get('number'):
-            target = contact['number']
+        if "number" in contact:
+            target = contact["number"]
         else:
-            target = contact['groupId']
-            args.append('--group')
-        args.append(target)
+            # TODO
+            logging.warning("sending message to groups is not yet supported")
+            #target = contact['groupId']
 
-        attachment_paths = [os.path.expanduser(attachment) for attachment in attachments]
-        if all([os.path.exists(attachment_path) for attachment_path in attachment_paths]):
-            if attachment_paths:
-                args.append('--attachment')
-            for attachment_path in attachment_paths:
-                args.append(attachment_path)
-        else:
-            logging.warning('send_message: Attached file(s) does not exist.')
-            return
+        # Generate a random ID
+        msg_id = "".join(
+            random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(10))
 
-        p = Popen(args, stdout=PIPE, stderr=PIPE)
-        _out, error = p.communicate()
-        if p.returncode != 0:
-            logging.error('send_message: exit code=%d:err=%s', p.returncode, error)
-            # https://github.com/AsamK/signal-cli/issues/73
-            # return
+        payload = {
+            "type": "send", 
+            "id": msg_id,
+            "username": self.user,
+            "recipientNumber": target,
+            "messageBody": message
+        }
 
-        ts = int(datetime.now().timestamp() * 1000)
-        envelope = {'source':self.user,
-                    'target': target,
-                    'timestamp': ts,
-                    'dataMessage': {'message': message,
-                                    'attachments': attachments,
-                                    'timestamp': ts}}
+        # The daemon will answer, but the answer will be catched by daemon_handler
+        # So add this message into the waiting list
+        self.sent_waiting[msg_id] = payload
 
-        urwid.emit_signal(self, 'send_message', envelope)
+        # Send
+        self.fd.send(json.dumps(payload).encode("utf8") + b"\n")
+        logging.debug("Message from {} to {} is sending".format(
+            self.user,
+            target
+        ))
 
     def contacts(self):
         return sorted(list(filter(
@@ -1349,9 +1374,8 @@ class State:
             return
         logging.info('MESSAGE:%s', envelope)
 
-        if sender != self.current_contact:
-            notif = 'New message from ' + contact_name + ': "' + msg + '"'
-            self.set_notification(notif, sender)
+        notif = 'New message from ' + contact_name + ': "' + msg + '"'
+        self.set_notification(notif, sender)
 
         formatted_message = self.print_received_message(envelope)
         self.commands.send_notification(contact_name, to_txt(formatted_message))
@@ -1501,7 +1525,7 @@ def main():
 
     parser.add_argument('-n',
                         '--enable-notifications',
-                        default=False,
+                        default=True,
                         action='store_true',
                         help='Enable desktop notifications. (Also see --notification-command)')
 
@@ -1537,9 +1561,9 @@ def main():
 
     parser.add_argument('-s',
                         '--save-history',
-                        default=False,
+                        default=True,
                         action='store_true',
-                        help='Enable saving history. History is saved as plain text. (Disabled by default.)')
+                        help='Enable saving history. History is saved as plain text. (Enabled by default.)')
 
     parser.add_argument('-f',
                         '--use-formatting',
@@ -1567,10 +1591,6 @@ def main():
                         default=False,
                         action='store_true',
                         help='Autohide the contacts pane when it loses focus. (Disabled by default)')
-
-    parser.add_argument('--no-daemon',
-                        action='store_true',
-                        help='Not really useful.')
 
     parser.add_argument('--debug',
                         default=False,
@@ -1602,13 +1622,12 @@ def main():
 
     if not cfg.username:
         ulist = []
-        for folder in [SIGNALCLI_DATA_FOLDER, SIGNALCLI_LEGACY_DATA_FOLDER]:
-            try:
-                users = [x for x in os.listdir(folder)
-                         if os.path.isfile(os.path.join(folder, x))]
-                ulist.extend(users)
-            except FileNotFoundError:
-                pass
+        try:
+            users = [x for x in os.listdir(SIGNALD_DATA_FOLDER)
+                     if os.path.isfile(os.path.join(SIGNALD_DATA_FOLDER, x))]
+            ulist.extend(users)
+        except FileNotFoundError:
+            pass
 
         if not ulist:
             print("Couldn't find any linked device.", file=sys.stderr)
@@ -1630,12 +1649,8 @@ def main():
     state.load_history()
     atexit.register(state.save_history)
 
-    if not cfg.no_daemon:
-        proc = state.signal.start_daemon(loop)
-        atexit.register(proc.kill)
-
+    state.signal.start_daemon(loop)
     loop.run()
-    proc.kill()
 
 if __name__ == "__main__":
     main()
