@@ -54,6 +54,7 @@ PALETTE = [('normal', '', ''),
            ('box_normal', '', ''),
            ('box_focused', 'dark blue', ''),
            ('bold', 'bold', ''),
+           ('red', 'light red', ''),
            ('italic', 'italics', ''),
            ('strikethrough', 'strikethrough', ''),
            ('bolditalic', 'italics,bold', ''),
@@ -815,7 +816,7 @@ class ContactsWindow(urwid.ListBox):
 
         w.notify_count = count
         if count > 0:
-            w.original_widget.set_text([('bold', '({}) '.format(w.notify_count)), get_contact_name(w.contact)])
+            w.original_widget.set_text([('red', '({}) '.format(w.notify_count)), get_contact_name(w.contact)])
         else:
             w.original_widget.set_text(get_contact_name(w.contact))
 
